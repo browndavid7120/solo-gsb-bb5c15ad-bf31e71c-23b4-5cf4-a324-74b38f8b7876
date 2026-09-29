@@ -72,6 +72,29 @@ CREATE TABLE IF NOT EXISTS export_events (
     PRIMARY KEY (snapshot_id, seq)                  -- 按原 seq 升序分页
 );
 
+-- 快照字段覆盖画像的持久化结果: 首次查询时基于 export_events 副本一次性计算,
+-- 与路径统计同事务原子落库(行存在即代表已完成, 无半成品状态)
+CREATE TABLE IF NOT EXISTS export_field_coverage (
+    snapshot_id    INTEGER PRIMARY KEY,            -- 所属快照(随快照删除同事务清除)
+    total_events   INTEGER NOT NULL,               -- 画像口径的事件总数(即快照副本数)
+    path_count     INTEGER NOT NULL,               -- 去重后的路径总数(可观测信息; 翻页边界由 LIMIT+1 判定)
+    generated_at   TEXT NOT NULL                   -- 统计生成时间(UTC ISO8601)
+);
+
+CREATE TABLE IF NOT EXISTS export_field_coverage_paths (
+    snapshot_id    INTEGER NOT NULL,               -- 所属快照(随快照删除同事务清除)
+    path           TEXT NOT NULL,                  -- 转义后的 payload 路径(根为空串)
+    present_events INTEGER NOT NULL,               -- 该路径出现的事件数(同事件内去重)
+    t_object       INTEGER NOT NULL,               -- 以下六列为各 JSON 类型的事件数
+    t_array        INTEGER NOT NULL,
+    t_string       INTEGER NOT NULL,
+    t_number       INTEGER NOT NULL,
+    t_boolean      INTEGER NOT NULL,
+    t_null         INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_id, path)
+) WITHOUT ROWID;
+-- 字典序游标分页即主键扫描, 无需额外索引
+
 CREATE TABLE IF NOT EXISTS count_views (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,  -- 视图 ID
     name       TEXT NOT NULL UNIQUE,               -- 客户端指定的唯一视图名
@@ -160,6 +183,9 @@ def get_conn():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # 画像首次生成等较长写事务持锁期间, 并发写请求(含并发首次查询)排队等待,
+    # 而不是直接抛 SQLITE_BUSY; 仍由 BEGIN IMMEDIATE 串行化, 不会产生重复结果
+    conn.execute("PRAGMA busy_timeout=10000")
     try:
         yield conn
         conn.commit()

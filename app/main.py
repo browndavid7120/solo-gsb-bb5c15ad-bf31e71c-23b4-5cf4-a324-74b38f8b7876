@@ -1,4 +1,3 @@
-import bisect
 import json
 import secrets
 import sqlite3
@@ -207,6 +206,8 @@ def remove_event_from_views(conn: sqlite3.Connection, *, occurred_at: str, paylo
 
 # 画像使用的六种 JSON 类型(标量统一四类, 整数与浮点不区分)
 FIELD_TYPES: tuple[str, ...] = ("object", "array", "string", "number", "boolean", "null")
+# 持久化统计表中的类型列名, 顺序与 FIELD_TYPES 一一对应
+FIELD_TYPE_COLUMNS: tuple[str, ...] = tuple(f"t_{t}" for t in FIELD_TYPES)
 
 
 def json_type_of(value: Any) -> str:
@@ -304,6 +305,77 @@ def aggregate_field_coverage(payloads: Iterator[Any]) -> tuple[int, dict[str, di
         for p, t in seen_path_types:
             paths[p]["types"][t] += 1
     return total, paths
+
+
+def ensure_field_coverage(conn: sqlite3.Connection, export_id: int) -> Optional[sqlite3.Row]:
+    """确保快照的路径统计已持久化, 返回统计头行(不存在的快照返回 None)。
+
+    统计结果惰性生成: 首次查询(含本功能上线前已存在的快照)在单个写事务
+    (BEGIN IMMEDIATE)内扫描 export_events 副本一次性聚合, 随后把统计头与
+    全部路径行**同一事务**原子写入——行只在事务提交后才可见, 不存在半成品。
+    并发首次查询在写锁上串行: 首个查询计算并落库, 其余查询持锁后复查命中,
+    不会重复计算或写入。之后的翻页只读路径表, 不再扫描副本, 与事件数无关。
+    统计只来自快照副本, 绝不读取当前 events 表。调用方须持有已确认存在的快照。
+    """
+    header = conn.execute(
+        "SELECT total_events, path_count FROM export_field_coverage"
+        " WHERE snapshot_id = ?",
+        (export_id,),
+    ).fetchone()
+    if header is not None:
+        return header
+
+    # 快速路径未命中: 取写锁后复查, 把并发首次查询串行化
+    conn.execute("BEGIN IMMEDIATE")
+    # 持锁复查: 可能已被并发的首个查询生成, 也可能快照正被并发删除
+    header = conn.execute(
+        "SELECT total_events, path_count FROM export_field_coverage"
+        " WHERE snapshot_id = ?",
+        (export_id,),
+    ).fetchone()
+    if header is not None:
+        return header
+    if conn.execute(
+        "SELECT 1 FROM export_snapshots WHERE id = ?", (export_id,)
+    ).fetchone() is None:
+        # 快照在本事务等待写锁期间被删除: 不生成任何统计, 由调用方按 404 处理
+        return None
+
+    rows = conn.execute(
+        "SELECT payload FROM export_events WHERE snapshot_id = ? ORDER BY seq",
+        (export_id,),
+    ).fetchall()
+    total, path_stats = aggregate_field_coverage(
+        json.loads(r["payload"]) for r in rows
+    )
+    generated_at = utc_now()
+    all_paths = sorted(path_stats)
+    conn.execute(
+        "INSERT INTO export_field_coverage (snapshot_id, total_events, path_count,"
+        " generated_at) VALUES (?, ?, ?, ?)",
+        (export_id, total, len(all_paths), generated_at),
+    )
+    if all_paths:
+        # executemany 同事务批量落库: 提交前对外完全不可见
+        conn.executemany(
+            "INSERT INTO export_field_coverage_paths (snapshot_id, path,"
+            " present_events, t_object, t_array, t_string, t_number, t_boolean,"
+            " t_null) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    export_id,
+                    p,
+                    path_stats[p]["present"],
+                    *(path_stats[p]["types"][t] for t in FIELD_TYPES),
+                )
+                for p in all_paths
+            ],
+        )
+    return conn.execute(
+        "SELECT total_events, path_count FROM export_field_coverage"
+        " WHERE snapshot_id = ?",
+        (export_id,),
+    ).fetchone()
 
 
 # ---------- endpoints ----------
@@ -1239,63 +1311,85 @@ def export_field_coverage(
     用于排查事件载荷格式不一致(某字段时有时无、同一路径出现多种类型)。全部统计
     只来自 export_events 快照副本, 不读不写 events 表, 也不返回任何具体字段值。
 
+    路径统计在首次查询时基于副本**一次性聚合并持久化**(含本功能上线前已存在的
+    快照); 聚合结果与快照删除共用同一把写锁, 并发首次查询只有一个真正计算,
+    其余持锁后复用, 不会产生重复或半成品结果。之后翻页按路径游标只读取该页
+    (SQLite 主键范围扫描), 延迟与快照事件数无关; 服务重启后统计仍可复用。
+
     - 递归包含根、对象、数组与标量: 根路径为空串 ""; 对象键按 JSON Pointer
       风格编码(~、/、* 分别转义为 ~0、~1、~2); 数组下标统一为 "*"。
     - 同一事件内同一路径只计一次出现, 同一(路径, 类型)也只计一次; 混合数组
       可使各类型计数之和超过出现数; null 计为出现; 空数组不产生元素路径。
     - 按路径字典序分页: 只取严格大于 after_path 的项, 缺省从头; next_after_path
-      为下一页游标, 末页为 null。空快照返回 total=0 与空列表。
+      为下一页游标, 末页为 null。空快照首次查询只持久化 total=0 的统计头,
+      始终返回空列表。
     - 快照未知或已删除返回 404; limit 越界或 after_path 不是合法路径编码返回 422。
     """
+    cursor = "" if after_path is None else after_path
+
     with get_conn() as conn:
+        # 未知或已删除的快照统一 404(先于游标校验, 保持原有边界)
         snap = conn.execute(
             "SELECT id FROM export_snapshots WHERE id = ?",
             (export_id,),
         ).fetchone()
-        # 未知或已删除的快照统一 404
         if snap is None:
             return JSONResponse(status_code=404, content={"detail": "export not found"})
 
-        cursor = "" if after_path is None else after_path
         if not valid_field_path(cursor):
             return JSONResponse(
                 status_code=422,
                 content={"detail": "after_path is not a valid encoded path", "after_path": cursor},
             )
 
-        rows = conn.execute(
-            "SELECT payload FROM export_events WHERE snapshot_id = ? ORDER BY seq",
-            (export_id,),
-        ).fetchall()
+        # 首次查询在此一次性聚合并原子落库; 已生成则只做一次主键命中查询
+        header = ensure_field_coverage(conn, export_id)
+        if header is None:
+            # 等待写锁期间快照被并发删除
+            return JSONResponse(status_code=404, content={"detail": "export not found"})
+        total = header["total_events"]
 
-    total, path_stats = aggregate_field_coverage(json.loads(r["payload"]) for r in rows)
-    # 副本不可变: 聚合计数即快照 total, 空快照天然得到 0 与空路径集
-    all_paths = sorted(path_stats)
-    if after_path is None:
-        # 缺省从头: 含根路径 ""
-        start_idx = 0
-    else:
-        # 显式游标: 只取严格大于游标的路径(bisect_right 为 > 语义);
-        # 显式 after_path="" 与缺省不同, 会跳过根路径
-        start_idx = bisect.bisect_right(all_paths, cursor)
-    page_paths = all_paths[start_idx : start_idx + limit]
+        if after_path is None:
+            # 缺省从头: 含根路径 ""
+            rows = conn.execute(
+                "SELECT path, present_events, t_object, t_array, t_string, t_number,"
+                " t_boolean, t_null FROM export_field_coverage_paths"
+                " WHERE snapshot_id = ? ORDER BY path LIMIT ?",
+                (export_id, limit + 1),
+            ).fetchall()
+        else:
+            # 显式游标: 只取严格大于游标的路径; 显式 after_path="" 与缺省不同,
+            # 会跳过根路径
+            rows = conn.execute(
+                "SELECT path, present_events, t_object, t_array, t_string, t_number,"
+                " t_boolean, t_null FROM export_field_coverage_paths"
+                " WHERE snapshot_id = ? AND path > ? ORDER BY path LIMIT ?",
+                (export_id, cursor, limit + 1),
+            ).fetchall()
 
+    # 多取一条判断是否还有下一页
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
+    type_columns = FIELD_TYPE_COLUMNS
     items: list[dict[str, Any]] = []
-    for p in page_paths:
-        stats = path_stats[p]
-        present = stats["present"]
+    for row in rows:
         # 只列出计数 > 0 的类型; 顺序固定为 FIELD_TYPES
-        types = {t: c for t, c in stats["types"].items() if c > 0}
+        types = {
+            t: row[col]
+            for t, col in zip(FIELD_TYPES, type_columns)
+            if row[col] > 0
+        }
+        present = row["present_events"]
         items.append(
             {
-                "path": p,
+                "path": row["path"],
                 "present_events": present,
                 "missing_events": total - present,
                 "type_events": types,
             }
         )
 
-    has_more = start_idx + limit < len(all_paths)
     return {
         "export_id": export_id,
         "total": total,
@@ -1303,13 +1397,13 @@ def export_field_coverage(
         "limit": limit,
         "items": items,
         # 末页(含空页、空快照)为 null
-        "next_after_path": page_paths[-1] if has_more else None,
+        "next_after_path": rows[-1]["path"] if has_more else None,
     }
 
 
 @app.delete("/exports/{export_id}")
 def delete_export(export_id: int = Path(...)):
-    """删除快照: 同一事务内原子删除元数据与全部事件副本。
+    """删除快照: 同一事务内原子删除元数据、全部事件副本与字段覆盖统计。
 
     未知或已删除的快照统一返回 404, 状态不变。
     """
@@ -1321,7 +1415,16 @@ def delete_export(export_id: int = Path(...)):
         # 未知或已删除统一 404
         if snap is None:
             return JSONResponse(status_code=404, content={"detail": "export not found"})
+        # 子表先删: 事件副本、画像路径行与统计头同事务清除, 不留孤儿统计
         conn.execute("DELETE FROM export_events WHERE snapshot_id = ?", (export_id,))
+        conn.execute(
+            "DELETE FROM export_field_coverage_paths WHERE snapshot_id = ?",
+            (export_id,),
+        )
+        conn.execute(
+            "DELETE FROM export_field_coverage WHERE snapshot_id = ?",
+            (export_id,),
+        )
         conn.execute("DELETE FROM export_snapshots WHERE id = ?", (export_id,))
     return {"export_id": export_id, "deleted": True}
 
