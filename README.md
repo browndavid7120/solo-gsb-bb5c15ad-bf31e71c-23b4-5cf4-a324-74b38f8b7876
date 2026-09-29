@@ -8,7 +8,7 @@
 docker compose up --build
 ```
 
-一条命令完成构建、数据库初始化与启动;服务监听 **8000** 端口,接口入口为 **http://localhost:8000**(交互式文档在 http://localhost:8000/docs,健康检查 http://localhost:8000/health)。SQLite 数据持久化在 named volume `webhook-data`,数据库表(含隔离记录表、快照导出表、日计数视图表、事件因果关系表)在启动时自动创建/升级,无需手工初始化。
+一条命令完成构建、数据库初始化与启动;服务监听 **8000** 端口,接口入口为 **http://localhost:8000**(交互式文档在 http://localhost:8000/docs,健康检查 http://localhost:8000/health)。SQLite 数据持久化在 named volume `webhook-data`,数据库表(含隔离记录表、快照导出表、快照字段覆盖统计表、日计数视图表、事件因果关系表)在启动时自动创建/升级,无需手工初始化。
 
 不用 compose 也可以:
 
@@ -412,7 +412,7 @@ curl 'http://localhost:8000/exports/1/events?after_seq=1100&limit=100'
 - `next_after_seq` 是下一页的起始序号,**末页为 `null`**;`after_seq == end_seq` 或空快照时始终返回空页(`events: []`、`next_after_seq: null`)。
 - 分页只读**副本**:快照之后的继续写入、原事件被压缩归档、服务重启都**不改变**已建快照的分页结果。
 
-删除快照(元数据与全部副本在**同一事务**内原子删除):
+删除快照(元数据、全部副本与字段覆盖统计在**同一事务**内原子删除):
 
 ```bash
 curl -X DELETE http://localhost:8000/exports/1
@@ -470,6 +470,29 @@ curl --get 'http://localhost:8000/exports/1/field-coverage' --data-urlencode 'af
 - **空快照**返回 `total: 0`、空 `items` 与 `next_after_path: null`。
 - 快照**未知或已删除返回 404**;`limit` 越界(不在 1~1000)或 `after_path` 不是合法路径编码(如非根路径不以 `/` 开头、出现裸 `~3`、键段内裸 `*`)返回 **422**(响应回显 `after_path`)。
 - 既有 `GET /exports/{id}/events` 导出接口的请求与响应格式保持不变。
+
+**统计持久化(首次计算一次,之后按页读取)**:
+
+- 画像结果按快照**持久化**在 `export_field_coverage_stats`(每路径一行)与 `export_field_coverage_status`(完成标记,空快照也有一行 `total=0`)。**首次查询**时(快照在统计落库前已存在也一样)基于 `export_events` 副本**一次性**计算,并在**同一个写事务**内原子写入统计行与完成标记;之后的每次翻页只按路径游标从统计表读取本页,**不再扫描副本**,每页延迟与快照事件数无关。
+- **并发首次查询**由写锁串行化:先到者持锁计算,后到者读到完成标记即直接复用——只计算一次,不会重复,也读不到半成品(标记与统计在同一事务提交,标记存在即代表统计完整可见)。
+- `DELETE /exports/{id}` 在**同一事务**内连同画像统计与完成标记一并删除,不残留孤儿数据;删除后再次查询返回 404。
+- 统计只来自快照副本本身,**不会**从当前 events 表补算;副本不可变,因此持久化结果与"每次现算"完全一致。
+
+```bash
+# 首次查询: 基于快照副本一次性计算并原子保存(快照较大时这一次稍慢)
+curl 'http://localhost:8000/exports/1/field-coverage?limit=2'
+# => {"export_id":1,"total":2,"after_path":"","limit":2,
+#     "items":[{"path":"","present_events":2,...},{"path":"/score",...}],
+#     "next_after_path":"/score"}
+
+# 之后翻页只读持久化统计的本页(毫秒级, 与事件数无关)
+curl --get 'http://localhost:8000/exports/1/field-coverage' \
+  --data-urlencode 'after_path=/score' --data 'limit=2'
+
+# 删除快照: 副本、画像统计与完成标记在同一事务内清理
+curl -X DELETE http://localhost:8000/exports/1
+# => {"export_id":1,"deleted":true}; 再查画像返回 404
+```
 
 ### 12. 事件日计数视图
 
@@ -622,7 +645,7 @@ curl -X PUT http://localhost:8000/relations/evt-c/parent \
 - **毒丸隔离**:`POST /consumers/{consumer_id}/quarantine` 在单个 `BEGIN IMMEDIATE` 事务内完成"核对令牌(与 `ack` 同套:无租约/过期/旧令牌 409)→ 核对租约起点与游标相邻(考虑链锚点)→ 复制首条事件完整内容、原哈希与非空原因到独立 `quarantined_events` 表 → 游标仅越过这一条并清除整批租约"。下次 `pull` 重新租用剩余事件并换发新 token,旧令牌立即作废;失败原因空白返回 422。`GET /consumers/{consumer_id}/quarantine` 分页查看隔离记录;副本独立于原事件存储,原事件被压缩归档(物理删除)后仍可查看。隔离会把游标推进过该事件,因此被隔离事件视为"已处理",可正常纳入安全归档,内容由隔离副本留存。
 - **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀 → 写链锚点"。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。
 - **持久化快照导出**:`POST /exports` 在单个 `BEGIN IMMEDIATE` 事务内完成"读链锚点 → 写快照元数据(锚点 seq/hash、末尾 seq、总数)→ `INSERT ... SELECT` 整体复制当前全部未压缩事件到 `export_events`",与事件写入、压缩归档串行,副本与元数据来自同一时刻。副本落库后不可变:`GET /exports/{id}/events` 只查快照表,按 `(snapshot_id, seq)` 主键升序分页(多取一条判断 `next_after_seq`,末页为 `null`),后续写入/压缩/重启均不影响;`after_seq` 越出 `[anchor_seq, end_seq]` 返回 422。`DELETE /exports/{id}` 在同一事务内删除元数据与全部副本,未知或已删除统一 404。
-- **快照字段覆盖画像**:`GET /exports/{id}/field-coverage` 只读 `export_events` 副本(不读不写 events、不返回字段值),对每条 payload 用显式栈迭代递归(避免深层 JSON 触发递归上限),产出 (路径, JSON 类型) 集合:根路径 `""`、对象键把 `~`/`/`/`*` 转义为 `~0`/`~1`/`~2`、数组下标统一 `*`、空数组不产生元素路径。聚合时**出现按路径、类型按 (路径, 类型) 双重去重**——同一事件同路径只计一次、每种类型也只计一次,因此混合数组的类型数之和可超过出现数,`null` 计为出现,`missing = total - present`。结果按路径字典序做键集分页(只取严格大于 `after_path` 的项;缺省从根 `""` 起含根,显式空串游标则跳过根;`bisect_right` 定位,末页 `next_after_path` 为 null)。空快照返回 `total=0` 空列表;未知/已删除 404,`limit` 越界或游标不是合法转义(非根不以 `/` 开头、裸 `~n`、键段内裸 `*`)422。不改动既有 `/exports/{id}/events` 导出接口。
+- **快照字段覆盖画像**:`GET /exports/{id}/field-coverage` 只读 `export_events` 副本(不读不写 events、不返回字段值),对每条 payload 用显式栈迭代递归(避免深层 JSON 触发递归上限),产出 (路径, JSON 类型) 集合:根路径 `""`、对象键把 `~`/`/`/`*` 转义为 `~0`/`~1`/`~2`、数组下标统一 `*`、空数组不产生元素路径。聚合时**出现按路径、类型按 (路径, 类型) 双重去重**——同一事件同路径只计一次、每种类型也只计一次,因此混合数组的类型数之和可超过出现数,`null` 计为出现,`missing = total - present`。统计结果**持久化**在 `export_field_coverage_stats`(`(snapshot_id, path)` 主键,每路径一行出现/缺失/六类类型计数)与 `export_field_coverage_status`(完成标记,空快照也写 `total=0` 一行):**首次查询**(含已存在快照)在 `BEGIN IMMEDIATE` 写事务内基于副本一次性计算并原子写入"统计行 + 完成标记",并发首次查询被写锁串行化——后到者复查到标记即复用,只算一次、无重复、无半成品(标记与统计同事务提交);之后翻页按路径主键做键集分页(`path > after_path` 字典序,多取一条判断 `next_after_path`,末页为 null),只读统计表本页,不再扫描副本,每页延迟与事件数无关。`DELETE /exports/{id}` 在同一事务内删除统计与标记。空快照返回 `total=0` 空列表;未知/已删除 404,`limit` 越界或游标不是合法转义(非根不以 `/` 开头、裸 `~n`、键段内裸 `*`)422。不改动既有 `/exports/{id}/events` 导出接口。
 - **事件日计数视图**:规则存 `count_views`(名称 `UNIQUE`,重名 409),日桶计数存 `count_view_buckets`(`(view_id, day)` 主键)。`POST /views` 在单个 `BEGIN IMMEDIATE` 事务内"保存规则 → 全量扫描现存事件按 UTC 日期回填";`/events` 与 `/events/batch` 只对真正新建的条目逐视图匹配增量 +1(重复 `event_id` 走幂等分支,不动视图);`/retention/compact` 在同一事务内对被删前缀逐条扣减并移除空桶——因此视图始终等于"当前 events 表内匹配事件按发生日期的计数",迟到事件按 `occurred_at` 归其发生日期。`GET /views/{name}` 按名称返回各日计数与总数,`DELETE /views/{name}` 单事务删除规则与日桶,未知名称均 404。
 - **事件因果关系**:关系存独立表 `event_relations`(`event_id` 主键保证唯一父事件,另建 `parent_id` 索引),**不建指向 events 的外键**,故 `/retention/compact` 物理删除事件后已登记关系仍保留可查。`PUT /relations/{event_id}/parent` 在单个 `BEGIN IMMEDIATE` 事务内完成"校验子事件现存 → 校验父事件现存(均 404)→ 拒绝自环(409)→ 同一父节点幂等返回 `unchanged` → **从新父事件沿父链上行, 命中子事件即判定成环**(409, 原关系不变)→ UPSERT 写入/更换"。环检测从新父侧上行是关键:边的终点能沿现存边到达边的起点才成环(如 `c→b→a` 已存在,再把 `a` 指向 `c`),仅检查子事件祖先会漏判。`GET /relations/{event_id}/ancestors` 沿关系表上行(穿越已归档节点),按最近父节点到根返回 `event_id`/`depth`(最近父节点 depth=1);已知节点的判定覆盖 events 表与关系图两侧(登记过父或被他人登记为父),因此归档后仍按 ID 可查,只有完全未知的 ID 返回 404。
 - **配置**:数据库路径由环境变量 `DB_PATH` 控制(容器内默认 `/data/events.db`)。
@@ -645,8 +668,8 @@ curl -X PUT http://localhost:8000/relations/evt-c/parent \
 | POST | `/retention/compact` | 安全归档压缩连续事件前缀(`cutoff_seq`/`dry_run`);越界 409 并返回 `safe_through_seq` |
 | POST | `/exports` | 创建持久化快照:单事务复制全部未压缩事件与链锚点,返回快照 ID、锚点 seq/hash、末尾 seq 与总数 |
 | GET | `/exports/{id}/events` | 按原 `seq` 升序分页读取快照副本(`after_seq` 默认锚点序号,限 `[anchor_seq, end_seq]` 否则 422;`limit` 1~1000;`next_after_seq` 末页为 null) |
-| GET | `/exports/{id}/field-coverage` | 读取快照副本的字段覆盖画像:按路径(根 `''`、键转义 `~0/~1/~2`、数组下标 `*`)统计出现/缺失事件数与各 JSON 类型事件数;`after_path` 字典序游标(严格大于,缺省含根)、`limit` 1~1000,`next_after_path` 末页为 null;只读副本不返回字段值;未知快照 404,非法游标/`limit` 422 |
-| DELETE | `/exports/{id}` | 单事务原子删除快照元数据与全部副本;未知或已删除统一 404 |
+| GET | `/exports/{id}/field-coverage` | 读取快照副本的字段覆盖画像:按路径(根 `''`、键转义 `~0/~1/~2`、数组下标 `*`)统计出现/缺失事件数与各 JSON 类型事件数;首次查询基于副本一次性计算并原子持久化(并发只算一次),之后按 `after_path` 字典序游标(严格大于,缺省含根)只读持久化结果的本页,`limit` 1~1000,`next_after_path` 末页为 null;只读副本不返回字段值;未知快照 404,非法游标/`limit` 422 |
+| DELETE | `/exports/{id}` | 单事务原子删除快照元数据、全部副本与画像统计;未知或已删除统一 404 |
 | POST | `/views` | 创建事件日计数视图(唯一名称 + 可选 payload 顶层字符串字段等值条件):单事务回填现存事件,按 UTC 日期分桶;重名 409 |
 | GET | `/views/{name}` | 按名称查询视图:各 UTC 日计数(升序)及总数;未知名称 404 |
 | DELETE | `/views/{name}` | 单事务删除视图规则与全部日桶;未知名称 404 |

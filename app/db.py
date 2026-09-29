@@ -72,6 +72,26 @@ CREATE TABLE IF NOT EXISTS export_events (
     PRIMARY KEY (snapshot_id, seq)                  -- 按原 seq 升序分页
 );
 
+CREATE TABLE IF NOT EXISTS export_field_coverage_stats (
+    snapshot_id    INTEGER NOT NULL,                -- 所属快照(随快照同事务删除)
+    path           TEXT NOT NULL,                   -- 画像路径("" 为根; JSON Pointer 风格转义)
+    present_events INTEGER NOT NULL,                -- 该路径出现(计 null)的事件数
+    missing_events INTEGER NOT NULL,                -- 该路径缺失的事件数(total - present)
+    type_object    INTEGER NOT NULL DEFAULT 0,      -- 以下六列: 各 JSON 类型的(路径,类型)去重事件数
+    type_array     INTEGER NOT NULL DEFAULT 0,
+    type_string    INTEGER NOT NULL DEFAULT 0,
+    type_number    INTEGER NOT NULL DEFAULT 0,
+    type_boolean   INTEGER NOT NULL DEFAULT 0,
+    type_null      INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (snapshot_id, path)                 -- 路径字典序即主键序, 键集分页只读本页
+);
+
+CREATE TABLE IF NOT EXISTS export_field_coverage_status (
+    snapshot_id INTEGER PRIMARY KEY,                -- 完成标记: 存在即该快照画像已原子算完(含空快照)
+    total       INTEGER NOT NULL,                   -- 计算时快照副本事件总数(空快照为 0)
+    computed_at TEXT NOT NULL                       -- 首次计算时间(UTC ISO8601)
+);
+
 CREATE TABLE IF NOT EXISTS count_views (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,  -- 视图 ID
     name       TEXT NOT NULL UNIQUE,               -- 客户端指定的唯一视图名
@@ -157,9 +177,11 @@ def _backfill_chain(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    # 首次画像计算可能持写锁扫描较大快照: 让并发查询等待写锁而不是立即报 locked
+    conn.execute("PRAGMA busy_timeout=30000")
     try:
         yield conn
         conn.commit()
